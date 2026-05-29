@@ -820,7 +820,12 @@ func (d *windowsDataplane) createAndAttachContainerEP(args *skel.CmdArgs,
 		} else {
 			d.logger.Infof("Attempting to create HostComputeEndpoint: %s for container", endpointName)
 
-			hcsEndpoint, err = hns.AddHcnEndpoint(endpointName, hnsNetwork.Id, args.Netns, func() (*hcn.HostComputeEndpoint, error) {
+			// addHcnEndpointWhenReady waits for the endpoint's vNIC to reach
+			// State:3 (attached to the vSwitch) before calling
+			// AddNamespaceEndpoint, which programs the SLB OutBoundNAT VFP
+			// rules.  Calling AddNamespaceEndpoint while the port is still in
+			// State:1 causes HNS to silently skip OutBoundNAT programming.
+			hcsEndpoint, err = addHcnEndpointWhenReady(endpointName, hnsNetwork.Id, args.Netns, func() (*hcn.HostComputeEndpoint, error) {
 				hce := &hcn.HostComputeEndpoint{
 					Name:               endpointName,
 					HostComputeNetwork: hnsNetwork.Id,
@@ -848,7 +853,7 @@ func (d *windowsDataplane) createAndAttachContainerEP(args *skel.CmdArgs,
 					Policies: v2pols,
 				}
 				return hce, nil
-			})
+			}, d.logger)
 
 			if err == nil {
 				d.logger.Infof("Endpoint to container created! %v", hcsEndpoint)
