@@ -19,8 +19,9 @@ import (
 //	1 = Created  — vNIC not yet attached to the vSwitch
 //	3 = Attached — vNIC is live; VFP rules can be programmed
 //
-// The Resources JSON is returned by the default hcn.GetEndpointByID query
-// and is accessible via HostComputeEndpoint.Health.Extra.Resources.
+// The Resources JSON is only populated when the HCN query uses
+// HostComputeQueryFlagsDetailed; it is absent with the default
+// HostComputeQueryFlagsNone.
 type endpointResources struct {
 	State uint16 `json:"State"`
 }
@@ -29,15 +30,39 @@ type endpointResources struct {
 // until its vNIC transitions to State:3 (attached to the vSwitch) or until
 // timeout is exceeded.
 //
+// The query MUST use HostComputeQueryFlagsDetailed; without that flag HCN
+// omits the Health.Extra.Resources field entirely, so State is never populated
+// and every call would time out (which was the vfp-optc regression: a silent
+// 10-second delay that pushed AddNamespaceEndpoint past the SLB dynnat
+// programming window).
+//
 // On timeout the function returns a non-nil error; on HCN query failure the
 // error is returned immediately.
 func waitForEndpointVNICAttach(endpointID string, timeout time.Duration, logger *logrus.Entry) error {
 	deadline := time.Now().Add(timeout)
+
+	// HostComputeQueryFlagsDetailed is required to populate Health.Extra.Resources.
+	// The default query (HostComputeQueryFlagsNone) omits that field, making
+	// State detection impossible.
+	filterJSON, err := json.Marshal(map[string]string{"ID": endpointID})
+	if err != nil {
+		return fmt.Errorf("waitForEndpointVNICAttach: failed to build query filter: %w", err)
+	}
+	detailedQuery := hcn.HostComputeQuery{
+		SchemaVersion: hcn.SchemaVersion{Major: 2, Minor: 0},
+		Flags:         hcn.HostComputeQueryFlagsDetailed,
+		Filter:        string(filterJSON),
+	}
+
 	for {
-		ep, err := hcn.GetEndpointByID(endpointID)
+		endpoints, err := hcn.ListEndpointsQuery(detailedQuery)
 		if err != nil {
 			return fmt.Errorf("waitForEndpointVNICAttach: HCN query failed: %w", err)
 		}
+		if len(endpoints) == 0 {
+			return fmt.Errorf("waitForEndpointVNICAttach: endpoint %s not found", endpointID)
+		}
+		ep := &endpoints[0]
 
 		if len(ep.Health.Extra.Resources) > 0 {
 			var res endpointResources
