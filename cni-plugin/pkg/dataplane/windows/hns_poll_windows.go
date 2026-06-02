@@ -82,6 +82,16 @@ func waitForEndpointVNICAttach(endpointID string, timeout time.Duration, logger 
 	}
 }
 
+// vnICAttachTimeout is the maximum time we wait for an HCN endpoint's vNIC to
+// transition from State:1 (created) to State:3 (attached to the vSwitch)
+// before calling AddNamespaceEndpoint.
+//
+// 60 seconds is chosen to accommodate nodes under heavy load during large
+// Windows container image pulls (2–3 GiB images can cause >10 s vSwitch
+// plumbing delays due to CPU/IO contention).  The Kubernetes CNI call timeout
+// is 5 minutes by default, so 60 s leaves ample headroom.
+const vnICAttachTimeout = 60 * time.Second
+
 // addHcnEndpointWhenReady is a drop-in replacement for hns.AddHcnEndpoint that
 // inserts a wait for the endpoint's vNIC to reach State:3 (attached to the
 // vSwitch) between Create() and AddNamespaceEndpoint.
@@ -90,6 +100,10 @@ func waitForEndpointVNICAttach(endpointID string, timeout time.Duration, logger 
 // endpoint.  If the vNIC has not yet been attached to the vSwitch (State:1),
 // HNS silently skips OutBoundNAT rule programming.  Waiting for State:3
 // before calling AddNamespaceEndpoint ensures the rules are applied correctly.
+//
+// If the vNIC does not reach State:3 within vnICAttachTimeout the CNI ADD
+// call fails with an error.  This causes the pod to be retried rather than
+// starting silently with broken SNAT rules.
 func addHcnEndpointWhenReady(
 	epName string,
 	expectedNetworkID string,
@@ -131,9 +145,18 @@ func addHcnEndpointWhenReady(
 	// the endpoint to the namespace.  AddNamespaceEndpoint programs SLB VFP
 	// rules; calling it while the port is in State:1 causes HNS to silently
 	// skip OutBoundNAT rule programming.
-	if waitErr := waitForEndpointVNICAttach(hcnEndpoint.Id, 10*time.Second, logger); waitErr != nil {
-		logger.WithError(waitErr).Warning(
-			"Timed out waiting for endpoint vNIC State:3 before AddNamespaceEndpoint; OutBoundNAT rules may be missing")
+	//
+	// On timeout we fail the CNI ADD rather than falling through with State:1.
+	// A pod that fails to start is retried by the kubelet; a pod that starts
+	// with missing SNAT rules is silently broken and never self-heals.
+	if waitErr := waitForEndpointVNICAttach(hcnEndpoint.Id, vnICAttachTimeout, logger); waitErr != nil {
+		if isNewEndpoint {
+			if removeErr := hns.RemoveHcnEndpoint(epName); removeErr != nil {
+				logger.WithError(removeErr).Warningf(
+					"failed to remove HostComputeEndpoint %s after vNIC attach timeout", epName)
+			}
+		}
+		return nil, fmt.Errorf("addHcnEndpointWhenReady: %w", waitErr)
 	}
 
 	// Add the endpoint to the network namespace, this programs VFP rules.
